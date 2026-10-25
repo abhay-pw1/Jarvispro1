@@ -1,237 +1,223 @@
-import "dotenv/config";
 import express from "express";
 import cors from "cors";
+import dotenv from "dotenv";
 import rateLimit from "express-rate-limit";
 import { GoogleGenAI } from "@google/genai";
+
+dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const GEMINI_MODEL =
-  process.env.GEMINI_MODEL || "gemini-2.5-flash";
+// IMPORTANT: Render reverse proxy configuration.
+// This must be before rate limiting middleware.
+app.set("trust proxy", 1);
 
-const ai = process.env.GEMINI_API_KEY
-  ? new GoogleGenAI({
-      apiKey: process.env.GEMINI_API_KEY
-    })
+// Middleware
+app.use(cors());
+app.use(express.json({ limit: "1mb" }));
+
+// Gemini configuration
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_MODEL = process.env.GEMINI_MODEL;
+
+const gemini = GEMINI_API_KEY
+  ? new GoogleGenAI({ apiKey: GEMINI_API_KEY })
   : null;
 
-if (!ai) {
-  console.error("GEMINI_API_KEY is missing.");
-}
+// Request timeout
+const REQUEST_TIMEOUT_MS = 45000;
 
-app.use(
-  cors({
-    origin: process.env.CORS_ORIGIN
-      ? process.env.CORS_ORIGIN
-          .split(",")
-          .map((value) => value.trim())
-      : true
-  })
-);
-
-app.use(express.json({ limit: "32kb" }));
-
-app.use(
-  "/api",
-  rateLimit({
-    windowMs: 60 * 1000,
-    limit: 30,
-    standardHeaders: true,
-    legacyHeaders: false
-  })
-);
-
-// Home
-app.get("/", (_req, res) => {
-  res.json({
-    name: "JARVIS AI Backend",
-    status: "online",
-    provider: "Google Gemini",
-    endpoints: ["/health", "/api/chat", "/api/voice"]
-  });
+// Rate limiter
+const limiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 60,
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
 });
 
-// Health
-app.get("/health", (_req, res) => {
+app.use(limiter);
+
+// Health check
+app.get("/health", (req, res) => {
   res.json({
     status: "ok",
+    service: "JARVIS Gemini Backend",
     provider: "Google Gemini",
-    configured: Boolean(ai)
+    model: GEMINI_MODEL || "NOT_CONFIGURED",
+    configured: Boolean(gemini && GEMINI_MODEL),
   });
 });
 
-// Chat
+// Root endpoint
+app.get("/", (req, res) => {
+  res.json({
+    message: "JARVIS Gemini Backend is running.",
+    endpoints: ["/health", "/api/chat", "/api/voice"],
+  });
+});
+
+// Gemini chat endpoint
 app.post("/api/chat", async (req, res) => {
+  const controller = new AbortController();
+
+  const timeout = setTimeout(() => {
+    controller.abort();
+  }, REQUEST_TIMEOUT_MS);
+
   try {
-    if (!ai) {
+    if (!GEMINI_API_KEY || !gemini) {
       return res.status(503).json({
-        error: "Gemini API key is not configured."
+        error: "Gemini API key is missing in Render Environment Variables.",
       });
     }
 
-    const { message, history = [] } = req.body ?? {};
+    if (!GEMINI_MODEL) {
+      return res.status(503).json({
+        error: "GEMINI_MODEL is missing in Render Environment Variables.",
+      });
+    }
 
-    if (
-      typeof message !== "string" ||
-      !message.trim() ||
-      message.length > 6000
-    ) {
+    const { message, history = [] } = req.body || {};
+
+    if (typeof message !== "string" || !message.trim()) {
       return res.status(400).json({
-        error: "A message of 1-6000 characters is required."
+        error: "A non-empty message is required.",
       });
     }
 
-    const safeHistory = Array.isArray(history)
-      ? history
-          .slice(-8)
-          .filter(
-            (item) =>
-              item &&
-              ["user", "assistant", "model"].includes(item.role) &&
-              typeof item.content === "string" &&
-              item.content.length <= 3000
-          )
-      : [];
+    const contents = [];
 
-    const contents = safeHistory
-      .filter((item) => item.content.trim())
-      .map((item) => ({
-        role: item.role === "assistant" ? "model" : item.role,
-        parts: [{ text: item.content }]
-      }));
+    if (Array.isArray(history)) {
+      for (const item of history.slice(-12)) {
+        if (!item || typeof item.content !== "string") continue;
+
+        let role;
+
+        if (item.role === "assistant" || item.role === "model") {
+          role = "model";
+        } else if (item.role === "user") {
+          role = "user";
+        } else {
+          continue;
+        }
+
+        contents.push({
+          role,
+          parts: [{ text: item.content }],
+        });
+      }
+    }
 
     contents.push({
       role: "user",
-      parts: [{ text: message.trim() }]
+      parts: [{ text: message.trim() }],
     });
 
-    const response = await ai.models.generateContent({
+    console.log("Gemini request received:", {
+      model: GEMINI_MODEL,
+      messageLength: message.length,
+    });
+
+    const result = await gemini.models.generateContent({
       model: GEMINI_MODEL,
       contents,
       config: {
-        systemInstruction: `
-You are JARVIS, a helpful futuristic AI assistant.
-
-LANGUAGE:
-- Understand Hindi, English and Hinglish.
-- Reply naturally in the user's language.
-- When the user speaks Hinglish, normally reply in conversational Hinglish.
-- Keep spoken responses concise unless more detail is requested.
-
-BEHAVIOUR:
-- Be accurate, helpful and respectful.
-- Admit uncertainty instead of inventing facts.
-- Use conversation history when relevant.
-- Never claim a phone action was completed unless the app confirms it.
-- The Android app must execute phone actions using supported features
-  and the necessary permissions.
-`,
-        maxOutputTokens: 700
-      }
+        systemInstruction:
+          "You are JARVIS, a helpful AI assistant. Understand Hindi, English, and Hinglish. Reply in the language used by the user. Give useful, clear, accurate answers. Never claim to have performed actions on a device unless they actually happened.",
+      },
+      abortSignal: controller.signal,
     });
 
-    const reply = response.text?.trim();
+    const reply = result.text;
 
-    if (!reply) {
+    if (!reply || !reply.trim()) {
       return res.status(502).json({
-        error: "Gemini returned an empty response."
+        error: "Gemini returned an empty response.",
       });
     }
+
+    console.log("Gemini response received successfully.");
 
     return res.json({
-      reply,
+      reply: reply.trim(),
+      response: reply.trim(),
       provider: "Google Gemini",
-      model: GEMINI_MODEL
+      model: GEMINI_MODEL,
     });
   } catch (error) {
-    const status =
-      error.status ||
-      error.statusCode ||
-      error.response?.status;
+    console.error("Gemini request failed:", error);
 
-    console.error("Gemini chat error:", {
-      status: status || null,
-      message: error.message || "Unknown error"
-    });
-
-    if (status === 429) {
-      return res.status(429).json({
-        error: "Gemini rate limit reached. Please try again later."
-      });
-    }
-
-    if (status === 401 || status === 403) {
-      return res.status(502).json({
-        error: "Gemini authentication failed. Check API key and access."
+    if (error?.name === "AbortError") {
+      return res.status(504).json({
+        error: "Gemini request timed out. Please try again.",
       });
     }
 
     return res.status(502).json({
-      error: "JARVIS could not get a response from Gemini."
+      error: "Gemini request failed.",
+      details: error?.message || "Unknown Gemini error",
     });
+  } finally {
+    clearTimeout(timeout);
   }
 });
 
-// ElevenLabs voice
+// ElevenLabs voice endpoint
 app.post("/api/voice", async (req, res) => {
   try {
-    const { text } = req.body ?? {};
-
-    if (
-      typeof text !== "string" ||
-      !text.trim() ||
-      text.length > 3000
-    ) {
-      return res.status(400).json({
-        error: "Text of 1-3000 characters is required."
-      });
-    }
-
     const apiKey = process.env.ELEVENLABS_API_KEY;
     const voiceId = process.env.ELEVENLABS_VOICE_ID;
 
     if (!apiKey || !voiceId) {
       return res.status(503).json({
-        error: "ElevenLabs credentials are not configured."
+        error:
+          "Voice service is not configured. Check ElevenLabs environment variables.",
       });
     }
 
-    const modelId =
-      process.env.ELEVENLABS_MODEL_ID ||
-      "eleven_multilingual_v2";
+    const { text, message } = req.body || {};
+    const textToSpeak = text || message;
 
-    const upstream = await fetch(
-      `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(
-        voiceId
-      )}?output_format=mp3_44100_128`,
+    if (typeof textToSpeak !== "string" || !textToSpeak.trim()) {
+      return res.status(400).json({
+        error: "A non-empty text or message field is required.",
+      });
+    }
+
+    const response = await fetch(
+      `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
       {
         method: "POST",
         headers: {
           "xi-api-key": apiKey,
           "Content-Type": "application/json",
-          Accept: "audio/mpeg"
+          Accept: "audio/mpeg",
         },
         body: JSON.stringify({
-          text: text.trim(),
-          model_id: modelId
+          text: textToSpeak.trim(),
+          model_id: "eleven_multilingual_v2",
+          voice_settings: {
+            stability: 0.45,
+            similarity_boost: 0.75,
+          },
         }),
-        signal: AbortSignal.timeout(60000)
+        signal: AbortSignal.timeout(40000),
       }
     );
 
-    if (!upstream.ok) {
-      console.error(
-        "ElevenLabs request failed:",
-        upstream.status
-      );
+    if (!response.ok) {
+      const details = await response.text();
+
+      console.error("ElevenLabs error:", response.status, details);
 
       return res.status(502).json({
-        error: "Voice generation failed. Check ElevenLabs settings."
+        error: "ElevenLabs voice generation failed.",
+        details: details.slice(0, 800),
       });
     }
 
-    const audio = Buffer.from(await upstream.arrayBuffer());
+    const audio = Buffer.from(await response.arrayBuffer());
 
     res.setHeader("Content-Type", "audio/mpeg");
     res.setHeader("Content-Length", audio.length);
@@ -239,23 +225,40 @@ app.post("/api/voice", async (req, res) => {
 
     return res.send(audio);
   } catch (error) {
-    console.error("Voice error:", error.message);
+    console.error("Voice request failed:", error);
 
-    return res.status(500).json({
-      error: "Could not generate voice."
+    return res.status(502).json({
+      error: "Voice generation failed.",
+      details: error?.message || "Unknown voice error",
     });
   }
 });
 
-// Unknown endpoint
-app.use((_req, res) => {
+// Handle unknown routes
+app.use((req, res) => {
   res.status(404).json({
-    error: "Endpoint not found."
+    error: "Route not found.",
+    path: req.path,
+  });
+});
+
+// Global error handler
+app.use((error, req, res, next) => {
+  console.error("Server error:", error);
+
+  if (res.headersSent) {
+    return next(error);
+  }
+
+  return res.status(500).json({
+    error: "Internal server error.",
   });
 });
 
 // Start server
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`JARVIS backend running on port ${PORT}`);
-  console.log(`AI provider: Gemini (${GEMINI_MODEL})`);
+  console.log(`JARVIS backend listening on port ${PORT}`);
+  console.log(`AI provider: Google Gemini`);
+  console.log(`Gemini model: ${GEMINI_MODEL || "NOT CONFIGURED"}`);
+  console.log(`Gemini API key configured: ${Boolean(GEMINI_API_KEY)}`);
 });
